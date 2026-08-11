@@ -1,0 +1,234 @@
+import urllib.request
+import json
+import os
+import boto3
+
+from datetime import datetime
+from decimal import Decimal
+
+
+# --------------------------------------------------
+# 1. AWS CLIENTS
+# --------------------------------------------------
+
+s3 = boto3.client("s3")
+sns = boto3.client("sns")
+dynamodb = boto3.resource("dynamodb")
+
+
+# --------------------------------------------------
+# 2. CONFIGURATION
+# --------------------------------------------------
+
+# Alpha Vantage API key
+API_KEY = os.environ["ALPHA_API_KEY"]
+
+# S3 bucket
+BUCKET_NAME = "stock-market-data-akku"
+
+# SNS topic ARN
+SNS_TOPIC_ARN = "arn:aws:sns:ap-south-1:204098850686:StockPriceAlerts"
+
+# DynamoDB table
+DYNAMODB_TABLE_NAME = "StockAlertHistory"
+
+# Price threshold for alert
+PRICE_THRESHOLD = 315
+
+# --------------------------------------------------
+# 3. CONNECT TO DYNAMODB TABLE
+# --------------------------------------------------
+
+table = dynamodb.Table(DYNAMODB_TABLE_NAME)
+
+
+# --------------------------------------------------
+# 4. LAMBDA FUNCTION
+# --------------------------------------------------
+
+def lambda_handler(event, context):
+
+    # --------------------------------------------------
+    # 5. STOCK SYMBOL
+    # --------------------------------------------------
+
+    symbol = "AAPL"
+
+
+    # --------------------------------------------------
+    # 6. ALPHA VANTAGE API URL
+    # --------------------------------------------------
+
+    url = (
+        f"https://www.alphavantage.co/query?"
+        f"function=GLOBAL_QUOTE&"
+        f"symbol={symbol}&"
+        f"apikey={API_KEY}"
+    )
+
+
+    # --------------------------------------------------
+    # 7. CALL ALPHA VANTAGE API
+    # --------------------------------------------------
+
+    with urllib.request.urlopen(url) as response:
+        api_response = response.read().decode()
+
+
+    # --------------------------------------------------
+    # 8. CONVERT API RESPONSE TO DICTIONARY
+    # --------------------------------------------------
+
+    data = json.loads(api_response)
+
+
+    # --------------------------------------------------
+    # 9. CHECK API RESPONSE
+    # --------------------------------------------------
+
+    if "Global Quote" not in data:
+
+        return {
+            "statusCode": 400,
+            "body": json.dumps(data)
+        }
+
+
+    # --------------------------------------------------
+    # 10. EXTRACT GLOBAL QUOTE
+    # --------------------------------------------------
+
+    data = data["Global Quote"]
+
+
+    # --------------------------------------------------
+    # 11. CURRENT TIMESTAMP
+    # --------------------------------------------------
+
+    current_timestamp = datetime.now().isoformat()
+
+
+    # --------------------------------------------------
+    # 12. CREATE STOCK DICTIONARY
+    # --------------------------------------------------
+
+    stock = {
+        "symbol": data["01. symbol"],
+        "open": float(data["02. open"]),
+        "high": float(data["03. high"]),
+        "low": float(data["04. low"]),
+        "price": float(data["05. price"]),
+        "volume": int(data["06. volume"]),
+        "latest_trading_day": data["07. latest trading day"],
+        "previous_close": float(data["08. previous close"]),
+        "change": float(data["09. change"]),
+        "change_percent": data["10. change percent"],
+        "timestamp": current_timestamp
+    }
+
+
+    # --------------------------------------------------
+    # 13. CONVERT STOCK DATA TO JSON
+    # --------------------------------------------------
+
+    json_data = json.dumps(stock)
+
+
+    # --------------------------------------------------
+    # 14. CREATE UNIQUE S3 FILE NAME
+    # --------------------------------------------------
+
+    timestamp_for_filename = datetime.now().strftime(
+        "%Y-%m-%d_%H-%M-%S"
+    )
+
+    file_name = f"stocks/AAPL_{timestamp_for_filename}.json"
+
+
+    # --------------------------------------------------
+    # 15. UPLOAD STOCK DATA TO S3
+    # --------------------------------------------------
+
+    s3.put_object(
+        Bucket=BUCKET_NAME,
+        Key=file_name,
+        Body=json_data,
+        ContentType="application/json"
+    )
+
+
+    # --------------------------------------------------
+    # 16. CHECK PRICE THRESHOLD
+    # --------------------------------------------------
+
+    if stock["price"] >= PRICE_THRESHOLD:
+
+
+        # --------------------------------------------------
+        # 17. CREATE SNS MESSAGE
+        # --------------------------------------------------
+
+        message = (
+            f"AAPL Stock Price Alert!\n\n"
+            f"Current Price: ${stock['price']}\n"
+            f"Threshold: ${PRICE_THRESHOLD}\n"
+            f"Volume: {stock['volume']}\n"
+            f"Timestamp: {stock['timestamp']}"
+        )
+
+
+        # --------------------------------------------------
+        # 18. SEND SNS ALERT
+        # --------------------------------------------------
+
+        sns.publish(
+            TopicArn=SNS_TOPIC_ARN,
+            Subject="AAPL Stock Price Alert",
+            Message=message
+        )
+
+
+        # --------------------------------------------------
+        # 19. CREATE UNIQUE ALERT ID
+        # --------------------------------------------------
+
+        alert_id = (
+            f"{stock['symbol']}-"
+            f"{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        )
+
+
+        # --------------------------------------------------
+        # 20. SAVE ALERT TO DYNAMODB
+        # --------------------------------------------------
+
+        table.put_item(
+            Item={
+                "alert_id": alert_id,
+                "symbol": stock["symbol"],
+
+                # DynamoDB requires Decimal instead of float
+                "price": Decimal(str(stock["price"])),
+                "threshold": Decimal(str(PRICE_THRESHOLD)),
+
+                # Integer is supported by DynamoDB
+                "volume": stock["volume"],
+
+                "timestamp": stock["timestamp"],
+                "alert_status": "ALERT_SENT"
+            }
+        )
+
+
+    # --------------------------------------------------
+    # 21. RETURN SUCCESS RESPONSE
+    # --------------------------------------------------
+
+    return {
+        "statusCode": 200,
+        "body": json.dumps({
+            "message": "Stock data processed successfully",
+            "file": file_name,
+            "stock": stock
+        })
+    }
